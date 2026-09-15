@@ -45,6 +45,14 @@ type fakeBackend struct {
 	listPromptsErr   *jsonRPCError
 	listToolsErr     *jsonRPCError
 
+	// Optional HTTP-level error overrides. When set, the server returns a
+	// bare HTTP status code (no JSON-RPC body) for the corresponding list
+	// method, simulating a reverse proxy or API gateway that surfaces
+	// "method not implemented" as an HTTP status. See #5242.
+	listResourcesHTTPStatus int
+	listPromptsHTTPStatus   int
+	listToolsHTTPStatus     int
+
 	// Tools/resources/prompts to return when the corresponding list method
 	// is not configured to error.
 	tools     []mcp.Tool
@@ -186,6 +194,10 @@ func (f *fakeBackend) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Mcp-Session-Id", "test-session")
 		f.writeInitializeResult(w, msg.ID)
 	case string(mcp.MethodToolsList):
+		if f.listToolsHTTPStatus != 0 {
+			http.Error(w, http.StatusText(f.listToolsHTTPStatus), f.listToolsHTTPStatus)
+			return
+		}
 		if f.listToolsErr != nil {
 			f.writeError(w, msg.ID, f.listToolsErr)
 			return
@@ -196,12 +208,20 @@ func (f *fakeBackend) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		f.writeResult(w, msg.ID, map[string]any{"tools": f.tools})
 	case string(mcp.MethodResourcesList):
+		if f.listResourcesHTTPStatus != 0 {
+			http.Error(w, http.StatusText(f.listResourcesHTTPStatus), f.listResourcesHTTPStatus)
+			return
+		}
 		if f.listResourcesErr != nil {
 			f.writeError(w, msg.ID, f.listResourcesErr)
 			return
 		}
 		f.writeResult(w, msg.ID, map[string]any{"resources": f.resources})
 	case string(mcp.MethodPromptsList):
+		if f.listPromptsHTTPStatus != 0 {
+			http.Error(w, http.StatusText(f.listPromptsHTTPStatus), f.listPromptsHTTPStatus)
+			return
+		}
 		if f.listPromptsErr != nil {
 			f.writeError(w, msg.ID, f.listPromptsErr)
 			return
@@ -540,6 +560,97 @@ func TestInitAndQueryCapabilities_FatalErrors(t *testing.T) {
 			_, err := initAndQueryCapabilities(context.Background(), c, target)
 			require.Error(t, err)
 			assert.ErrorContains(t, err, tc.errSubstr)
+		})
+	}
+}
+
+// TestInitAndQueryCapabilities_HTTPMethodMissing verifies #5242: when a backend
+// advertises resources or prompts but returns HTTP 404/405/501 (instead of a
+// JSON-RPC -32601 envelope) for the corresponding list method, init must succeed
+// with an empty capability set — its tools must still aggregate. This extends the
+// existing -32601 tolerance to HTTP-level method-missing signals from backends
+// behind reverse proxies or API gateways.
+func TestInitAndQueryCapabilities_HTTPMethodMissing(t *testing.T) {
+	t.Parallel()
+
+	helloTool := mcp.Tool{Name: "hello"}
+
+	httpStatuses := []struct {
+		name   string
+		status int
+	}{
+		{"HTTP 404", http.StatusNotFound},
+		{"HTTP 405", http.StatusMethodNotAllowed},
+		{"HTTP 501", http.StatusNotImplemented},
+	}
+
+	for _, hs := range httpStatuses {
+		t.Run(hs.name+" on resources/list", func(t *testing.T) {
+			t.Parallel()
+			fb := &fakeBackend{
+				advertiseTools:          true,
+				advertiseResources:      true,
+				tools:                   []mcp.Tool{helloTool},
+				listResourcesHTTPStatus: hs.status,
+			}
+			url := newFakeBackend(t, fb)
+			c := newTestClient(t, url)
+			target := &vmcp.BackendTarget{
+				WorkloadID:    "fake-backend",
+				WorkloadName:  "fake-backend",
+				BaseURL:       url,
+				TransportType: "streamable-http",
+			}
+
+			caps, err := initAndQueryCapabilities(context.Background(), c, target)
+			require.NoError(t, err, "%s on resources/list must not abort init", hs.name)
+			require.NotNil(t, caps)
+			assert.Len(t, caps.Tools, 1, "tools must still aggregate")
+			assert.Empty(t, caps.Resources, "resources must degrade to empty")
+		})
+
+		t.Run(hs.name+" on prompts/list", func(t *testing.T) {
+			t.Parallel()
+			fb := &fakeBackend{
+				advertiseTools:        true,
+				advertisePrompts:      true,
+				tools:                 []mcp.Tool{helloTool},
+				listPromptsHTTPStatus: hs.status,
+			}
+			url := newFakeBackend(t, fb)
+			c := newTestClient(t, url)
+			target := &vmcp.BackendTarget{
+				WorkloadID:    "fake-backend",
+				WorkloadName:  "fake-backend",
+				BaseURL:       url,
+				TransportType: "streamable-http",
+			}
+
+			caps, err := initAndQueryCapabilities(context.Background(), c, target)
+			require.NoError(t, err, "%s on prompts/list must not abort init", hs.name)
+			require.NotNil(t, caps)
+			assert.Len(t, caps.Tools, 1, "tools must still aggregate")
+			assert.Empty(t, caps.Prompts, "prompts must degrade to empty")
+		})
+
+		t.Run(hs.name+" on tools/list remains fatal", func(t *testing.T) {
+			t.Parallel()
+			fb := &fakeBackend{
+				advertiseTools:      true,
+				listToolsHTTPStatus: hs.status,
+			}
+			url := newFakeBackend(t, fb)
+			c := newTestClient(t, url)
+			target := &vmcp.BackendTarget{
+				WorkloadID:    "fake-backend",
+				WorkloadName:  "fake-backend",
+				BaseURL:       url,
+				TransportType: "streamable-http",
+			}
+
+			_, err := initAndQueryCapabilities(context.Background(), c, target)
+			require.Error(t, err, "%s on tools/list must abort init", hs.name)
+			assert.ErrorContains(t, err, "list tools failed")
 		})
 	}
 }

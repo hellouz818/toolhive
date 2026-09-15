@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"syscall"
 	"time"
 
@@ -847,11 +848,32 @@ func queryBackendTools(ctx context.Context, c *mcpclient.Client, target *vmcp.Ba
 	return out, nil
 }
 
+// isHTTPMethodMissing checks whether an error indicates an HTTP-level
+// method-not-supported response (404 Not Found, 405 Method Not Allowed,
+// or 501 Not Implemented). Some backends sit behind reverse proxies or API
+// gateways that surface "method not implemented" as an HTTP status rather
+// than as a JSON-RPC -32601 envelope. See #5242.
+//
+// This uses string matching on the error message because the go-sdk
+// streamable-HTTP transport does not wrap non-transient HTTP errors with
+// a typed/sentinel error — 405 and 501 are surfaced as plain
+// fmt.Errorf("%s: %v", requestSummary, http.StatusText(resp.StatusCode)),
+// and 404 as ErrSessionMissing. If the SDK introduces structured HTTP
+// error types in the future, this should be replaced with errors.As.
+func isHTTPMethodMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Not Found") ||
+		strings.Contains(msg, "Method Not Allowed") ||
+		strings.Contains(msg, "Not Implemented")
+}
+
 // queryBackendResources lists the backend's resources with cursor-following pagination.
 // A backend that advertises the resources capability but does not implement
-// resources/list (JSON-RPC -32601, e.g. Atlassian Rovo, see #5231) is tolerated: it
-// returns no resources instead of failing the whole discovery. HTTP-level method absence
-// remains fatal.
+// resources/list (JSON-RPC -32601 or HTTP 404/405/501, see #5231, #5242) is
+// tolerated: it returns no resources instead of failing the whole discovery.
 func queryBackendResources(ctx context.Context, c *mcpclient.Client, target *vmcp.BackendTarget) ([]vmcp.Resource, error) {
 	resources, err := pagination.ListAll(ctx, func(ctx context.Context, cursor mcp.Cursor) ([]mcp.Resource, mcp.Cursor, error) {
 		req := mcp.ListResourcesRequest{}
@@ -862,9 +884,10 @@ func queryBackendResources(ctx context.Context, c *mcpclient.Client, target *vmc
 		}
 		return result.Resources, result.NextCursor, nil
 	})
-	if errors.Is(err, mcp.ErrMethodNotFound) {
+	if errors.Is(err, mcp.ErrMethodNotFound) || isHTTPMethodMissing(err) {
 		slog.Warn("backend advertised resources capability but does not implement resources/list",
-			"backendID", target.WorkloadID, "name", target.WorkloadName, "baseURL", target.BaseURL, "method", "resources/list")
+			"backendID", target.WorkloadID, "name", target.WorkloadName, "baseURL", target.BaseURL,
+			"method", "resources/list", "error", err)
 		return nil, nil
 	}
 	if err != nil {
@@ -884,8 +907,8 @@ func queryBackendResources(ctx context.Context, c *mcpclient.Client, target *vmc
 }
 
 // queryBackendPrompts lists the backend's prompts with cursor-following pagination.
-// Like queryBackendResources, it tolerates a -32601 from a backend that advertises the
-// prompts capability without implementing prompts/list.
+// Like queryBackendResources, it tolerates a -32601 or HTTP 404/405/501 from a
+// backend that advertises the prompts capability without implementing prompts/list.
 func queryBackendPrompts(ctx context.Context, c *mcpclient.Client, target *vmcp.BackendTarget) ([]vmcp.Prompt, error) {
 	prompts, err := pagination.ListAll(ctx, func(ctx context.Context, cursor mcp.Cursor) ([]mcp.Prompt, mcp.Cursor, error) {
 		req := mcp.ListPromptsRequest{}
@@ -896,9 +919,10 @@ func queryBackendPrompts(ctx context.Context, c *mcpclient.Client, target *vmcp.
 		}
 		return result.Prompts, result.NextCursor, nil
 	})
-	if errors.Is(err, mcp.ErrMethodNotFound) {
+	if errors.Is(err, mcp.ErrMethodNotFound) || isHTTPMethodMissing(err) {
 		slog.Warn("backend advertised prompts capability but does not implement prompts/list",
-			"backendID", target.WorkloadID, "name", target.WorkloadName, "baseURL", target.BaseURL, "method", "prompts/list")
+			"backendID", target.WorkloadID, "name", target.WorkloadName, "baseURL", target.BaseURL,
+			"method", "prompts/list", "error", err)
 		return nil, nil
 	}
 	if err != nil {
