@@ -1999,6 +1999,101 @@ func TestListCapabilities_ToolsOnlyBackendSkipsUnadvertisedSurfaces(t *testing.T
 	assert.Empty(t, caps.Prompts)
 }
 
+// TestListCapabilities_HTTPMethodMissing verifies that HTTP-level
+// method-missing responses (404, 405, 501) from resources/list and
+// prompts/list are tolerated the same way as JSON-RPC -32601.
+// Backends behind reverse proxies or API gateways may surface
+// "method not implemented" as an HTTP status rather than a JSON-RPC
+// error envelope. See #5242.
+func TestListCapabilities_HTTPMethodMissing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		statusCode int
+	}{
+		{"HTTP 405 Method Not Allowed", http.StatusMethodNotAllowed},
+		{"HTTP 501 Not Implemented", http.StatusNotImplemented},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mcpServer := mcpserver.NewMCPServer("http-error-backend", "1.0.0",
+				mcpserver.WithResourceCapabilities(true, false),
+				mcpserver.WithPromptCapabilities(true),
+			)
+			mcpServer.AddTool(
+				mcp.Tool{Name: "my-tool", Description: "a test tool"},
+				func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("ok")}}, nil
+				},
+			)
+
+			statusCode := tt.statusCode
+			httpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+					return
+				}
+				rawMessage, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, "Failed to read request", http.StatusBadRequest)
+					return
+				}
+				defer r.Body.Close()
+
+				var probe struct {
+					ID     any    `json:"id"`
+					Method string `json:"method"`
+				}
+				if err := json.Unmarshal(rawMessage, &probe); err == nil {
+					switch probe.Method {
+					case "resources/list", "resources/templates/list", "prompts/list":
+						http.Error(w, http.StatusText(statusCode), statusCode)
+						return
+					}
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				response := mcpServer.HandleMessage(r.Context(), rawMessage)
+				responseBytes, err := json.Marshal(response)
+				if err != nil {
+					http.Error(w, "Failed to marshal response", http.StatusInternalServerError)
+					return
+				}
+				_, _ = w.Write(responseBytes)
+			})
+
+			server := httptest.NewServer(httpHandler)
+			defer server.Close()
+
+			registry := auth.NewDefaultOutgoingAuthRegistry()
+			require.NoError(t, registry.RegisterStrategy("unauthenticated", &strategies.UnauthenticatedStrategy{}))
+
+			backendClient, err := NewHTTPBackendClient(registry)
+			require.NoError(t, err)
+
+			target := &vmcp.BackendTarget{
+				WorkloadID:    "http-error-backend",
+				WorkloadName:  "HTTP Error Backend",
+				BaseURL:       server.URL,
+				TransportType: "streamable-http",
+			}
+
+			caps, err := backendClient.ListCapabilities(t.Context(), target)
+			require.NoError(t, err, "HTTP %d on resources/list and prompts/list must not drop the backend", statusCode)
+			require.NotNil(t, caps)
+
+			assert.Empty(t, caps.Resources, "resources must degrade to an empty list")
+			assert.Empty(t, caps.Prompts, "prompts must degrade to an empty list")
+			require.Len(t, caps.Tools, 1, "the backend's tools must still aggregate")
+			assert.Equal(t, "my-tool", caps.Tools[0].Name)
+		})
+	}
+}
+
 // TestDefaultClientFactory_SSEForwarding verifies the SSE transport gets the
 // same elicitation/sampling forwarding handlers as streamable-http when
 // forwarding is requested and forwarders are bound, and that Initialize declares

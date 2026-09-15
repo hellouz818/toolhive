@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -946,6 +947,24 @@ func queryTools(ctx context.Context, c *client.Client, supported bool, backendID
 	return &mcp.ListToolsResult{Tools: []mcp.Tool{}}, nil
 }
 
+// isHTTPMethodMissing checks whether an error indicates an HTTP-level
+// method-not-supported response (405 Method Not Allowed or 501 Not
+// Implemented). Some backends sit behind reverse proxies or API gateways
+// that surface "method not implemented" as an HTTP status rather than as
+// a JSON-RPC -32601 envelope. See #5242.
+//
+// HTTP 404 is deliberately excluded: the go-sdk streamable transport
+// interprets 404 as "session terminated by server" (ErrSessionMissing),
+// which has different recovery semantics than method absence.
+func isHTTPMethodMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Method Not Allowed") ||
+		strings.Contains(msg, "Not Implemented")
+}
+
 // queryResources queries resources from a backend if the server advertises
 // resource support. It follows MCP pagination cursors (see queryTools).
 func queryResources(ctx context.Context, c *client.Client, supported bool, backendID string) (*mcp.ListResourcesResult, error) {
@@ -959,9 +978,9 @@ func queryResources(ctx context.Context, c *client.Client, supported bool, backe
 			}
 			return result.Resources, result.NextCursor, nil
 		})
-		if errors.Is(err, mcp.ErrMethodNotFound) {
+		if errors.Is(err, mcp.ErrMethodNotFound) || isHTTPMethodMissing(err) {
 			slog.Warn("backend advertised resources capability but does not implement resources/list",
-				"backendID", backendID, "method", "resources/list")
+				"backendID", backendID, "method", "resources/list", "error", err)
 			return &mcp.ListResourcesResult{Resources: []mcp.Resource{}}, nil
 		}
 		if err != nil {
@@ -992,12 +1011,12 @@ func queryResourceTemplates(
 				return result.ResourceTemplates, result.NextCursor, nil
 			})
 		// A backend that advertises the resources capability but does not
-		// implement resources/templates/list (JSON-RPC -32601) degrades to an
-		// empty template list — its other capabilities still aggregate. Other
-		// errors still propagate and drop the backend's capability set.
-		if errors.Is(err, mcp.ErrMethodNotFound) {
+		// implement resources/templates/list (JSON-RPC -32601 or HTTP 404/405/501)
+		// degrades to an empty template list — its other capabilities still
+		// aggregate. Other errors still propagate and drop the backend's capability set.
+		if errors.Is(err, mcp.ErrMethodNotFound) || isHTTPMethodMissing(err) {
 			slog.Debug("backend does not implement resources/templates/list, treating templates as empty",
-				"backend", backendID)
+				"backend", backendID, "error", err)
 			return &mcp.ListResourceTemplatesResult{ResourceTemplates: []mcp.ResourceTemplate{}}, nil
 		}
 		if err != nil {
@@ -1022,9 +1041,9 @@ func queryPrompts(ctx context.Context, c *client.Client, supported bool, backend
 			}
 			return result.Prompts, result.NextCursor, nil
 		})
-		if errors.Is(err, mcp.ErrMethodNotFound) {
+		if errors.Is(err, mcp.ErrMethodNotFound) || isHTTPMethodMissing(err) {
 			slog.Warn("backend advertised prompts capability but does not implement prompts/list",
-				"backendID", backendID, "method", "prompts/list")
+				"backendID", backendID, "method", "prompts/list", "error", err)
 			return &mcp.ListPromptsResult{Prompts: []mcp.Prompt{}}, nil
 		}
 		if err != nil {
@@ -1303,9 +1322,11 @@ func (h *httpBackendClient) modernEnumerate(
 //   - a transient failure (errModernTransient: HTTP 408/429/5xx, a mid-stream
 //     read failure, or a transport/network error), after the mandatory
 //     tools/list has already succeeded, yields an empty list with a WARN;
-//   - a -32601 not-implemented (mcp.ErrMethodNotFound) yields an empty list
-//     when degradeNotFound is set. This is used for optional resource and
-//     prompt surfaces so a backend's remaining capabilities can still aggregate.
+//   - a -32601 not-implemented (mcp.ErrMethodNotFound) or an HTTP-level
+//     method-missing signal (405/501, see isHTTPMethodMissing) yields an
+//     empty list when degradeNotFound is set. This is used for optional
+//     resource and prompt surfaces so a backend's remaining capabilities
+//     can still aggregate.
 //
 // Any other error is returned to the caller, which fails the enumeration.
 func modernListOptional[T any](
@@ -1317,7 +1338,7 @@ func modernListOptional[T any](
 		slog.Warn(method+" transiently unavailable; degrading to empty list",
 			"backend", backend, "error", err)
 		return nil, nil
-	case errors.Is(err, mcp.ErrMethodNotFound) && degradeNotFound:
+	case (errors.Is(err, mcp.ErrMethodNotFound) || isHTTPMethodMissing(err)) && degradeNotFound:
 		return nil, nil
 	case err != nil:
 		return nil, err
